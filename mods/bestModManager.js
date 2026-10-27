@@ -116,6 +116,7 @@
   function bmmApp(boot) {
     'use strict';
     window.__bmmReady = true;
+    window.__bmmVersion = boot.version;
 
     var STORE = 'bmm_v1', REGKEY = 'bmm_registry_v1', ENABLED = 'enabledMods', LOADED = 'bmm_loaded', SELFKEY = 'bmm_self', STATUS = 'bmm_status';
     var SELF_RE = /bestModManager/i;
@@ -237,7 +238,7 @@
     }
     indexRegistry();
 
-    async function listFiles(repo, ref) {
+    async function listFiles(repo, ref, dir) {
       var enc = encodeURIComponent(ref);
       var tries = [
         async function () {
@@ -249,6 +250,12 @@
           var r = await fetch('https://data.jsdelivr.com/v1/package/gh/' + repo + '@' + enc + '/flat');
           if (!r.ok) throw new Error('jsDelivr ' + r.status);
           return ((await r.json()).files || []).map(function (f) { return { name: f.name, size: f.size }; });
+        },
+        async function () {
+          var r = await fetch('https://api.github.com/repos/' + repo + '/contents/' + dir + '?ref=' + enc);
+          if (!r.ok) throw new Error('GitHub ' + r.status);
+          var j = await r.json(); if (!Array.isArray(j)) throw new Error('GitHub: unexpected reply');
+          return j.filter(function (t) { return t.type === 'file'; }).map(function (t) { return { name: '/' + t.path, size: t.size }; });
         },
         async function () {
           var r = await fetch('https://api.github.com/repos/' + repo + '/git/trees/' + enc + '?recursive=1');
@@ -272,7 +279,7 @@
             if (rr.ok) { var rj = await rr.json(); if (/^[0-9a-f]{40}$/i.test(rj.version || '')) ref = rj.version; }
           } catch (e) { /* fall back to branch name */ }
           var prefix = '/' + String(src.path).replace(/^\/+|\/+$/g, '') + '/';
-          var files = (await listFiles(src.repo, ref)).filter(function (f) {
+          var files = (await listFiles(src.repo, ref, String(src.path).replace(/^\/+|\/+$/g, ''))).filter(function (f) {
             return f.name.indexOf(prefix) === 0 && f.name.indexOf('/', prefix.length) < 0 && /\.js$/i.test(f.name) && !/\.min\.js$/i.test(f.name) && !SELF_RE.test(f.name);
           });
           if (!files.length) throw new Error('no mods found in /' + src.path);
@@ -335,10 +342,12 @@
     function findDeps(text) {
       var out = {}, re = /dependOn\(/g, m;
       while ((m = re.exec(text))) {
-        var i = re.lastIndex, end = i + 4000, depth = 1, args = [], cur = '', q = null;
-        for (; i < text.length && i < end; i++) {
+        var i = re.lastIndex, depth = 1, args = [], cur = '', q = null;
+        for (; i < text.length; i++) {
           var c = text[i];
           if (q) { cur += c; if (c === '\\') { cur += text[++i] || ''; } else if (c === q) q = null; continue; }
+          if (c === '/' && text[i + 1] === '/') { var nl = text.indexOf('\n', i); i = nl < 0 ? text.length : nl; continue; }
+          if (c === '/' && text[i + 1] === '*') { var ce = text.indexOf('*/', i + 2); i = ce < 0 ? text.length : ce + 1; continue; }
           if (c === '"' || c === "'" || c === '`') { q = c; cur += c; continue; }
           if (c === '(' || c === '[' || c === '{') { depth++; cur += c; continue; }
           if (c === ')' || c === ']' || c === '}') { depth--; if (depth === 0) { args.push(cur); break; } cur += c; continue; }
@@ -923,9 +932,10 @@
     var w = null;
     try { w = window.open('', 'bmm_manager_window'); } catch (e) { w = null; }
     if (!w) return false;
-    try { if (w.__bmmReady) { w.focus(); return true; } } catch (e) { /* ignore */ }
+    try { if (w.__bmmReady && w.__bmmVersion === VERSION) { w.focus(); return true; } } catch (e) { /* ignore */ }
     var boot = themeInfo();
     boot.selfUrl = selfSrc;
+    boot.version = VERSION;
     var js = '(' + bmmApp.toString() + ')(' + JSON.stringify(boot).replace(/</g, '\\u003c') + ');';
     js = js.replace(/<\/script/gi, '<\\/script');
     var html = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
