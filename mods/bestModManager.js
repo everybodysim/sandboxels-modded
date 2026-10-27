@@ -274,10 +274,6 @@
         var br = branches[bi];
         try {
           var ref = br;
-          try { /* pin to a commit so CDN caching can't serve stale files */
-            var rr = await fetch('https://data.jsdelivr.com/v1/packages/gh/' + src.repo + '/resolved?specifier=' + encodeURIComponent(br));
-            if (rr.ok) { var rj = await rr.json(); if (/^[0-9a-f]{40}$/i.test(rj.version || '')) ref = rj.version; }
-          } catch (e) { /* fall back to branch name */ }
           var prefix = '/' + String(src.path).replace(/^\/+|\/+$/g, '') + '/';
           var files = (await listFiles(src.repo, ref, String(src.path).replace(/^\/+|\/+$/g, ''))).filter(function (f) {
             return f.name.indexOf(prefix) === 0 && f.name.indexOf('/', prefix.length) < 0 && /\.js$/i.test(f.name) && !/\.min\.js$/i.test(f.name) && !SELF_RE.test(f.name);
@@ -321,8 +317,13 @@
     var texts = {};
     async function getText(url) {
       if (texts[url] !== undefined) return texts[url];
-      var r = await fetch(url); if (!r.ok) throw new Error('HTTP ' + r.status);
-      return (texts[url] = await r.text());
+      var urls = [url], m = /^https:\/\/cdn\.jsdelivr\.net\/gh\/([^\/]+\/[^\/@]+)@[^\/]+\/(.+)$/.exec(url);
+      if (m) urls.push('https://cdn.jsdelivr.net/gh/' + m[1] + '/' + m[2], 'https://raw.githubusercontent.com/' + m[1] + '/main/' + m[2]);
+      var err;
+      for (var i = 0; i < urls.length; i++) {
+        try { var r = await fetch(urls[i]); if (r.ok) return (texts[url] = await r.text()); err = new Error('HTTP ' + r.status); } catch (e) { err = e; }
+      }
+      throw err;
     }
     var descs = {};
     async function loadDesc(it) {
@@ -856,41 +857,69 @@
         if (G.loadedMods.indexOf(name) >= 0 || G.queuedMods.indexOf(name) >= 0) continue;
         G.queuedMods.push(name);
         (function (n) {
-          var s = document.createElement('script'), real = resolveDep(n);
-          if (/^https:\/\/cdn\.jsdelivr\.net\//.test(real)) s.crossOrigin = 'anonymous';
-          s.async = false; s.src = real;
-          s.addEventListener('load', function () { try { G.checkDependents(n); } catch (e) { console.error(e); } G.loadedMods.push(n); pump(); });
-          s.addEventListener('error', function () { console.log('Error in mod: ' + real); });
-          document.head.appendChild(s);
+          var real = resolveDep(n), list = candidates(real), i = 0;
+          (function next() {
+            if (i >= list.length) { console.log('Error in mod: ' + real); return; }
+            tryOne(list[i++], 'mods/' + n).then(function (ok) {
+              if (!ok) return next();
+              try { G.checkDependents(n); } catch (e) { console.error(e); }
+              G.loadedMods.push(n); pump();
+            });
+          })();
         })(name);
       }
     }
 
-    /* Load in profile order. async=false makes the browser run them in that order too. */
-    plan.forEach(function (it) {
-      if (skip[it.entry]) { setStatus(it.entry, 'loaded'); return; }
+    /* Load one mod at a time, in profile order, trying fallbacks if a download fails. */
+    function candidates(src) {
+      var out = [{ u: src }], m = /^https:\/\/cdn\.jsdelivr\.net\/gh\/([^\/]+\/[^\/@]+)@[^\/]+\/(.+)$/.exec(src);
+      if (m) {
+        out.push({ u: 'https://cdn.jsdelivr.net/gh/' + m[1] + '@main/' + m[2] });
+        out.push({ u: 'https://cdn.jsdelivr.net/gh/' + m[1] + '/' + m[2] });
+        out.push({ u: 'https://raw.githubusercontent.com/' + m[1] + '/main/' + m[2], inline: true });
+      }
+      return out;
+    }
+    function tryOne(c, entry) {
+      return new Promise(function (resolve) {
+        try { byUrl[new URL(c.u, location.href).href] = entry; } catch (e) { /* ignore */ }
+        if (c.inline) { /* fetch the text and run it ourselves */
+          fetch(c.u).then(function (r) { if (!r.ok) throw 0; return r.text(); }).then(function (t) {
+            var s = document.createElement('script'); s.textContent = t + '\n//# sourceURL=' + c.u; document.head.appendChild(s); resolve(true);
+          }, function () { resolve(false); });
+          return;
+        }
+        var s = document.createElement('script');
+        if (/^https:\/\/cdn\.jsdelivr\.net\//.test(c.u)) s.crossOrigin = 'anonymous';
+        s.addEventListener('load', function () { resolve(true); });
+        s.addEventListener('error', function () { s.remove(); resolve(false); });
+        s.src = c.u; document.head.appendChild(s);
+      });
+    }
+    function loadOne(it) {
       var short = lastSeg(it.entry);
       var modName = /^https?:/i.test(it.entry) ? it.entry : short; /* the game's own naming rule */
       G.queuedMods.push(modName);
       setStatus(it.entry, 'loading');
-      var s = document.createElement('script');
-      if (/^https:\/\/cdn\.jsdelivr\.net\//.test(it.src)) s.crossOrigin = 'anonymous'; /* lets us see a mod's real error message */
-      s.async = false;
-      s.src = it.src;
-      try { byUrl[new URL(it.src, location.href).href] = it.entry; } catch (e) { /* ignore */ }
-      s.addEventListener('load', function () {
-        if (!status.items[it.entry] || status.items[it.entry].state === 'loading') setStatus(it.entry, 'loaded');
-        try { G.checkDependents(modName); } catch (e) { console.error('[bestModManager] error in dependOn callback for ' + it.entry, e); }
-        G.loadedMods.push(modName);
-        pump();
-      });
-      s.addEventListener('error', function () {
-        setStatus(it.entry, 'failed', 'Could not download ' + it.src);
-        console.log('Error in mod: ' + it.entry);
-        console.log('Could not download ' + it.src);
-        pump();
-      });
-      document.head.appendChild(s);
+      var list = candidates(it.src), i = 0;
+      function next() {
+        if (i >= list.length) {
+          setStatus(it.entry, 'failed', 'Could not download ' + it.src);
+          console.log('Error in mod: ' + it.entry); pump(); return Promise.resolve();
+        }
+        return tryOne(list[i++], it.entry).then(function (ok) {
+          if (!ok) return next();
+          if (!status.items[it.entry] || status.items[it.entry].state === 'loading') setStatus(it.entry, 'loaded');
+          try { G.checkDependents(modName); } catch (e) { console.error('[bestModManager] error in dependOn callback for ' + it.entry, e); }
+          G.loadedMods.push(modName); pump();
+        });
+      }
+      return next();
+    }
+    var chain = Promise.resolve();
+    plan.forEach(function (it) {
+      if (skip[it.entry]) { setStatus(it.entry, 'loaded'); return; }
+      chain = chain.then(function () { return loadOne(it); });
     });
   }
   try { bootGameSide(); } catch (e) { console.error('[bestModManager] startup error', e); }
