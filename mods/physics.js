@@ -684,11 +684,12 @@ if (elements.wall){
   W0.category = "anchored";
 }
 function canFall(id, e){
-  if (!e || e.tool || e.hidden || e.category !== "solids") return false;
-  if (e.state !== undefined && e.state !== "solid") return false;       // vanilla often leaves state out: that means solid
-  if (typeof e.behavior === "function") return false;
-  if (Array.isArray(e.behavior) && /M[12]/.test(JSON.stringify(e.behavior))) return false;   // self-moving
-  if (/^anchored_/.test(id)) return false;
+  /* ANY immovable material gets physics: solid (or state-less = solid), no tick, no self-moving behaviour */
+  if (!e || e.tool || e.hidden || id === "wall" || /^anchored_/.test(id)) return false;
+  if (e.category === "tools" || e.category === "energy") return false;
+  if (e.state !== undefined && e.state !== "solid") return false;
+  if (e.tick || !Array.isArray(e.behavior)) return false;
+  if (/M[12]/.test(JSON.stringify(e.behavior))) return false;
   return true;
 }
 Object.keys(elements).forEach(function(id){ if (canFall(id, elements[id])) FALL[id] = true; });
