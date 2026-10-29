@@ -50,12 +50,15 @@ function mark(x,y){ var gk = GK(x,y); if (!dirtyS.has(gk)){ dirtyS.add(gk); dirt
 function fallEl(id){
   var c = FC[id]; if (c !== undefined) return c;
   var e = elements[id], ok = true;
-  if (!e || e.tool || e.hidden || id === "wall" || /^anchored_/.test(id) || id === "physics_wall_x") ok = false;
+  if (!e || e.tool || e.hidden || /^anchored_/.test(id)) ok = false;
   else if (e.anchored) ok = false;
+  else if (id === "wall") ok = false;                          // raw wall stays anchored; physics_wall falls
   else if (e.category === "tools" || e.category === "energy" || e.category === "life" || e.category === "weapons") ok = false;
   else if (e.state !== undefined && e.state !== "solid") ok = false;
-  else if (typeof e.behavior === "function" || !Array.isArray(e.behavior)) ok = false;
-  else if (/M[12]/.test(JSON.stringify(e.behavior))) ok = false;                   // powders / self-moving
+  else if (e.behavior !== undefined && !Array.isArray(e.behavior)) ok = false;             // function behavior = self-moving
+  else if (Array.isArray(e.behavior) && /M[12]/.test(JSON.stringify(e.behavior))) ok = false;  // self-moving powders
+  else if (e.movable === true && e.category !== "solids") ok = false;               // movable land powders stay as powders
+  // else: WALL/SUPPORT/STURDYPOWDER/no-behavior solid → falls
   FC[id] = ok; return ok;
 }
 
@@ -470,16 +473,29 @@ function processPushes(){
 }
 /* free-flying grains: the powders' own physics (velocity, gravity, drag) until they settle */
 function flyGrain(p){
-  p.pvy += G*0.6; p.pvx *= 0.97; p.pvy *= 0.995;
+  p.pvy = (p.pvy || 0) + G*0.7;
+  p.pvx = (p.pvx || 0) * 0.96; p.pvy *= 0.98;
   p.qx = (p.qx || 0) + p.pvx; p.qy = (p.qy || 0) + p.pvy;
-  var sx = Math.trunc(p.qx), sy = Math.trunc(p.qy), i;
-  for (i = 0; i < Math.abs(sx); i++){
-    if (isEmpty(p.x + sign(sx), p.y)){ movePixel(p, p.x + sign(sx), p.y); p.qx -= sign(sx); } else { p.pvx = 0; p.qx = 0; break; }
+  var sx = Math.trunc(p.qx), sy = Math.trunc(p.qy), i, moved;
+  for (i = 0, moved = false; i < Math.abs(sx); i++){
+    var nx = p.x + sign(sx);
+    if (!outOfBounds(nx, p.y)){
+      var ob = pixelMap[nx][p.y];
+      if (!ob){ movePixel(p, nx, p.y); p.qx -= sign(sx); moved = true; }
+      else if (ob.sub !== undefined){ p.pvx = -p.pvx * 0.3; p.qx = 0; break; }
+      else { p.pvx *= -0.2; p.qx = 0; break; }
+    } else { p.pvx = 0; p.qx = 0; break; }
   }
   for (i = 0; i < Math.abs(sy); i++){
-    if (isEmpty(p.x, p.y + sign(sy))){ movePixel(p, p.x, p.y + sign(sy)); p.qy -= sign(sy); } else { p.pvy = 0; p.qy = 0; break; }
+    var ny = p.y + sign(sy);
+    if (!outOfBounds(p.x, ny)){
+      var ob2 = pixelMap[p.x][ny];
+      if (!ob2){ movePixel(p, p.x, ny); p.qy -= sign(sy); }
+      else if (ob2.sub !== undefined){ p.pvy *= -0.15; p.qy = 0; break; }
+      else { p.pvy *= -0.1; p.qy = 0; break; }
+    } else { p.pvy = 0; p.qy = 0; break; }
   }
-  if (Math.abs(p.pvx) + Math.abs(p.pvy) < 0.12){ delete p.pvx; delete p.pvy; delete p.qx; delete p.qy; }
+  if (Math.abs(p.pvx) + Math.abs(p.pvy) < 0.08){ delete p.pvx; delete p.pvy; delete p.qx; delete p.qy; }
 }
 
 /* ------------------------------------------------------------- buoyancy */
@@ -556,9 +572,15 @@ function checkSupport(p, checked){
     if (comp.length > 2500) supported = true;
   }
   comp.forEach(function(x){ checked.add(x); });
-  if (host){                                  // anything touching an existing body becomes part of it
-    comp.forEach(function(px){ if (!px.del && px.sub === undefined) joinPixel(host, px); });
-    return;
+  if (host){    // only join pixels the user explicitly just placed (have a fresh .pa stamp)
+    var joined = false;
+    comp.forEach(function(px){
+      if (!px.del && px.sub === undefined && px.pa !== undefined && pixelTicks - px.pa <= 2){
+        joinPixel(host, px); joined = true;
+      }
+    });
+    if (joined) return;
+    // if nothing was user-placed, the comp is just terrain: let it fall separately
   }
   if (!supported) bodyFromPixels(comp);
 }
@@ -769,6 +791,12 @@ runEveryTick(function(){
   ids = Object.keys(BODIES);
   for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead){ ensurePB(b); if (b.needSync){ b.needSync = false; syncProxies(b); } } }
   /* held/frozen bodies are static, everyone else dynamic */
+  /* save pre-step velocity so the powder-push loop can use impact speed */
+  var preVel = {};
+  for (i = 0; i < ids.length; i++){
+    b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== 'dynamic') continue;
+    var pv = b.pb.getLinearVelocity(); preVel[b.id] = { x: pv.x, y: pv.y };
+  }
   var forces = [];
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
@@ -788,12 +816,61 @@ runEveryTick(function(){
     b.pb.setLinearDamping(lin); b.pb.setAngularDamping(ang);
     forces.push({ b: b, F: Fb, x: fl.cx, y: fl.cy });
   }
-  refreshTerrain();
+  var anyMoving = false;
+  for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead && b.pb && b.pb.getType() === "dynamic" && b.pb.isAwake()) { anyMoving = true; break; } }
+  if (anyMoving || (pixelTicks % 6 === 0)) refreshTerrain();
+  /* direct powder push: scan the surface of each body's proxy footprint (uses live velocity pre-step) */
+  for (i = 0; i < ids.length; i++){
+    b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== "dynamic") continue;
+    var bvp = b.pb.getLinearVelocity(), bsp = Math.sqrt(bvp.x*bvp.x + bvp.y*bvp.y);
+    if (bsp < 0.08) continue;
+    var bv = { x: bvp.x, y: bvp.y };
+    /* also probe up to ceil(speed)+1 cells ahead in the velocity direction */
+    var predX = Math.round(bv.x * 1.2), predY = Math.round(bv.y * 1.2);
+    var extraProxies = [];
+    b.proxies.forEach(function(pix){ extraProxies.push(pix); });
+    var bvLen = Math.sqrt(bv.x*bv.x+bv.y*bv.y)||1, bdx=bv.x/bvLen, bdy=bv.y/bvLen;
+    b.proxies.forEach(function(pix){
+      for (var step = 1; step <= Math.ceil(bvLen)+1; step++){
+        var fx=Math.round(pix.x+bdx*step), fy=Math.round(pix.y+bdy*step);
+        if (!b.proxies.has(GK(fx,fy))) extraProxies.push({x:fx,y:fy,ck:pix.ck});
+      }
+    });
+    extraProxies.forEach(function(pix){
+      for (var d = 0; d < 4; d++){
+        var nx = pix.x + D4[d][0], ny = pix.y + D4[d][1];
+        if (outOfBounds(nx, ny)) continue;
+        var g = pixelMap[nx][ny]; if (!g || g.del || g.sub !== undefined) continue;
+        var ge = elements[g.element]; if (!ge) continue;
+        if (ge.state !== "solid" || ge.movable !== true) continue;        // only powders
+        var vn = bv.x * D4[d][0] + bv.y * D4[d][1];                     // body velocity towards the grain
+        if (vn <= 0) continue;
+        var resist = (ge.density || 1000)/1000 * G * 2.5;             // lower threshold: more grains flung
+        var mass = b.pb.getMass();
+        if (mass < (ge.density || 1000)/1000 * 1.0) continue;            // only very-light bodies rest on powder
+        var frac = Math.min(1, (vn - 0.05) * 0.4 * mass * 0.01);
+        if (frac <= 0) continue;
+        if (!chance(Math.min(0.9, frac))) continue;
+        /* sinking budget: at most ~4 pixels */
+        if (D4[d][1] > 0){                                                // downward push = sinking
+          b.sref = b.sref !== undefined ? b.sref : b.y; b.sT = pixelTicks;
+          if (b.y - b.sref > 4) continue;
+        }
+        var ox = g.x, oy = g.y;
+        if (relocate(g, nx, ny, null, null)){
+          g.pvx = D4[d][0] * Math.min(1.4, vn * 0.6 + (Math.random() - 0.5) * 0.3);
+          g.pvy = D4[d][1] * Math.min(1.4, vn * 0.5) - 0.1;
+        }
+      }
+    });
+    extraProxies = null;
+  }
   for (var s = 0; s < SUB; s++){
     for (i = 0; i < forces.length; i++) if (forces[i].F > 0) forces[i].b.pb.applyForce(PL.Vec2(0, -forces[i].F), PL.Vec2(forces[i].x, forces[i].y), true);
     world.step(DT, 8, 3);
   }
   processImpacts(); processPushes();
+
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
     var ps = b.pb.getPosition(); b.x = ps.x; b.y = ps.y; b.a = b.pb.getAngle();
@@ -838,5 +915,94 @@ loadPlanck();
 if (typeof globalThis !== "undefined" && globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf };
 }
+globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
+
 if (typeof logMessage === "function") logMessage("Sublevel Physics v5 (Planck.js / Box2D) loaded. Load it LAST in the mod list. Anything immovable falls when unsupported.");
+
+})();
+
+/* ── Rotated/snapped cursor when hovering over a physics body ──────────────── */
+(function(){
+  function bodyUnder(mx, my){
+    var px = pixelMap[mx] && pixelMap[mx][my];
+    if (px && px.sub !== undefined) return BODIES_REF()[px.sub] || null;
+    return null;
+  }
+  var orig_drawCursor = null, orig_mouseRange = null, hoverB = null;
+  function bodyAt(mx, my){
+    // check at mousePos and a 2px radius
+    var ids = Object.keys(BODIES_REF());
+    for (var i = 0; i < ids.length; i++){
+      var b = BODIES_REF()[ids[i]]; if (!b || b.dead) continue;
+      var dx = mx - b.x, dy = my - b.y, dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist <= b.rad + 1) return b;
+    }
+    return null;
+  }
+  function localGrid(b, wx, wy){
+    var dx = wx - b.x, dy = wy - b.y, c = Math.cos(-b.a), s = Math.sin(-b.a);
+    return { lx: Math.round(dx*c - dy*s), ly: Math.round(dx*s + dy*c) };
+  }
+  function worldGrid(b, lx, ly){
+    var c = Math.cos(b.a), s = Math.sin(b.a);
+    return { wx: b.x + lx*c - ly*s, wy: b.y + lx*s + ly*c };
+  }
+
+  if (typeof renderPostPixel === "function") renderPostPixel(function(ctx){
+    // Draw a separate rotated cursor overlay on the gui canvas
+    if (!hoverB || typeof canvasLayers === "undefined") return;
+    var b = hoverB;
+    var layerCtx = canvasLayers.gui && canvasLayers.gui.getContext && canvasLayers.gui.getContext("2d");
+    if (!layerCtx) return;
+    var ps = pixelSize, ms = typeof mouseSize !== "undefined" ? mouseSize : 1;
+    var mo = ms/2, mn = Math.trunc(mo), mx2 = mn - (mo%1 ? 0 : 1);
+    // convert mouse grid pos to body-local, snap, convert back
+    var mp = typeof mousePos !== "undefined" ? mousePos : {x:0,y:0};
+    var l = localGrid(b, mp.x, mp.y);
+    var c = Math.cos(b.a), si = Math.sin(b.a);
+    var wx0 = b.x + (l.lx - mn)*c - (l.ly - mn)*si, wy0 = b.y + (l.lx - mn)*si + (l.ly - mn)*c;
+    var wx1 = b.x + (l.lx + mx2)*c - (l.ly + mx2)*si, wy1 = b.y + (l.lx + mx2)*si + (l.ly + mx2)*c;
+    var ww = (mn + mx2 + 1)*ps, wh = ww;
+    layerCtx.save();
+    layerCtx.globalAlpha = 0.85;
+    layerCtx.strokeStyle = (typeof mouseColor !== "undefined" && mouseColor) || "white";
+    layerCtx.lineWidth = 2;
+    layerCtx.translate((b.x + 0.5)*ps, (b.y + 0.5)*ps);
+    layerCtx.rotate(b.a);
+    layerCtx.strokeRect((l.lx - mn - 0.5)*ps, (l.ly - mn - 0.5)*ps, (mn + mx2 + 1)*ps, (mn + mx2 + 1)*ps);
+    layerCtx.restore();
+  });
+
+  if (typeof runEveryTick === "function") runEveryTick(function(){
+    var mp = typeof mousePos !== "undefined" ? mousePos : null; if (!mp) return;
+    hoverB = null;
+    var px = pixelMap[mp.x] && pixelMap[mp.x][mp.y];
+    if (px && px.sub !== undefined) hoverB = BODIES_REF()[px.sub] || null;
+  });
+
+  // Patch mouseRange so placed/erased coords snap to the body's local grid
+  if (typeof mouseRange === "function" && !mouseRange.__slRotated){
+    var _mr = mouseRange;
+    window.mouseRange = function(mx, my, size){
+      var b = null;
+      var px = pixelMap[mx] && pixelMap[mx][my];
+      if (px && px.sub !== undefined) b = BODIES_REF()[px.sub] || null;
+      if (!b){ var px2 = pixelMap[mx] && pixelMap[mx][my+1]; if (px2 && px2.sub !== undefined) b = BODIES_REF()[px2.sub] || null; }
+      if (!b) return _mr(mx, my, size);
+      size = size || (typeof mouseSize !== "undefined" ? mouseSize : 1);
+      var mo = size/2, mn = Math.trunc(mo), mx2 = mn - (mo%1 ? 0 : 1);
+      var l = localGrid(b, mx, my), coords = [];
+      for (var lx = l.lx - mn; lx <= l.lx + mx2; lx++) for (var ly = l.ly - mn; ly <= l.ly + mx2; ly++){
+        var w = worldGrid(b, lx, ly);
+        coords.push([Math.round(w.wx), Math.round(w.wy)]);
+      }
+      return coords;
+    };
+    window.mouseRange.__slRotated = true;
+  }
+
+  var BODIES_REF = function(){ return {}; };
+  if (typeof globalThis !== "undefined" && globalThis.__SUBLEVEL_BODIES__){
+    BODIES_REF = globalThis.__SUBLEVEL_BODIES__;
+  }
 })();
